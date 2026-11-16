@@ -1,3 +1,7 @@
+// "Wooden Chess Board" <https://skfb.ly/oXqwI> by Bhargav Limje is licensed under Creative Commons Attribution (http://creativecommons.org/licenses/by/4.0/).
+// Pieces of Bevy code by Dr. Stefan Salewski: <https://github.com/stefansalewski/Bevy-3D-Chess.git> licensed under MIT.
+// JetBrainsMono Font is licensed under SIL Open Font License 1.1: <https://github.com/JetBrains/JetBrainsMono/tree/master>
+
 use bevy::color::palettes::tailwind::*;
 use bevy::prelude::*;
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
@@ -65,15 +69,29 @@ fn setup_hud(commands: &mut Commands, asset_server: &Res<AssetServer>) {
     ));
 }
 
-fn update_layer_hud(game: Res<GameData>, mut hud: Query<&mut Text, With<LayerHud>>) {
-    if !game.is_changed() {
+fn update_layer_hud(
+    game: Res<GameData>,
+    highlight_layers: Res<HighlightLayers>,
+    mut hud: Query<&mut Text, With<LayerHud>>,
+) {
+    if !game.is_changed() && !highlight_layers.is_changed() {
         return;
     }
 
     let lines = once("Bits:".to_string())
-        .chain(
-            (0..6).map(|layer| format!("{} {layer}", if layer == game.layer { "▶" } else { " " })),
-        )
+        .chain((0..6).map(|layer| {
+            format!(
+                "{} {layer}{}",
+                if layer == game.layer { "▶" } else { " " },
+                if highlight_layers.on & (1 << layer) != 0 {
+                    "◂"
+                } else if highlight_layers.off & (1 << layer) != 0 {
+                    "◃"
+                } else {
+                    ""
+                }
+            )
+        }))
         .chain(once(format!("\nTarget:",)))
         .chain((0..6).map(|bit| format!("  {}", (game.target >> bit) % 2)))
         .collect::<Vec<_>>()
@@ -88,6 +106,12 @@ fn update_layer_hud(game: Res<GameData>, mut hud: Query<&mut Text, With<LayerHud
 struct DrawNumbers(bool);
 
 #[derive(Resource, Default)]
+struct HighlightLayers {
+    on: u8,
+    off: u8,
+}
+
+#[derive(Resource, Default)]
 struct HoveredTile(Option<Entity>);
 
 #[derive(Component)]
@@ -95,6 +119,15 @@ struct HoverHud;
 
 #[derive(Component)]
 struct PuzzleHud;
+
+#[derive(Component)]
+struct PuzzleSolutionSphere;
+
+#[derive(Component)]
+struct PuzzleCoin {
+    x: usize,
+    z: usize,
+}
 
 fn remember_hover(over: On<PointerOver>, mut hovered: ResMut<HoveredTile>) {
     if over.pointer.id.is_mouse() {
@@ -140,24 +173,24 @@ fn update_hover_hud(
         .and_then(|entity| position.get(entity).ok())
         .filter(|position| position.location.y < 0.0)
         .map(|position| {
-            puzzle_tile_bits(
-                &game,
-                position.location.x as usize,
-                position.location.z as usize,
-            )
+            let x = position.location.x as usize;
+            let z = position.location.z as usize;
+            (0..6)
+                .map(|bit| {
+                    format!(
+                        "{} {}",
+                        layer_parity(&game, bit) as usize,
+                        game.values[bit][z][x] as usize
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         })
         .unwrap_or_default();
 
     for mut text in &mut puzzle_hud {
         text.0 = message.clone();
     }
-}
-
-fn puzzle_tile_bits(game: &GameData, x: usize, z: usize) -> String {
-    (0..6)
-        .map(|bit| format!("{}", game.values[bit][z][x] as usize))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[derive(Component, Reflect, Clone, Copy)]
@@ -208,21 +241,13 @@ struct GameData {
     values: Vec<Vec<Vec<bool>>>,
     puzzle: Vec<(usize, usize)>,
     target: u8,
+    solution: Option<(usize, usize)>,
 }
 
 impl Default for GameData {
     fn default() -> Self {
-        let mut rng: rand::rngs::SmallRng = rand::make_rng();
-        let target = rng.random::<u8>() % 64;
-        let count = rng.random::<u8>() % 65;
-        let all = (0..8)
-            .flat_map(|i| (0..8).map(move |j| (i, j)))
-            .collect::<Vec<_>>();
-        let puzzle = all
-            .sample(&mut rng, count as usize)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut values = vec![vec![vec![false; 8]; 8]; 8];
+        let (target, puzzle) = generate_puzzle();
+        let mut values = vec![vec![vec![false; 8]; 8]; 6];
         for power in 0..6 {
             for x in 0..8 {
                 for y in 0..8 {
@@ -238,8 +263,23 @@ impl Default for GameData {
             values,
             puzzle,
             target,
+            solution: None,
         }
     }
+}
+
+fn generate_puzzle() -> (u8, Vec<(usize, usize)>) {
+    let mut rng: rand::rngs::SmallRng = rand::make_rng();
+    let target = rng.random::<u8>() % 64;
+    let count = rng.random::<u8>() % 65;
+    let all = (0..8)
+        .flat_map(|i| (0..8).map(move |j| (i, j)))
+        .collect::<Vec<_>>();
+    let puzzle = all
+        .sample(&mut rng, count as usize)
+        .cloned()
+        .collect::<Vec<_>>();
+    (target, puzzle)
 }
 
 fn update_layer_visibility(
@@ -280,18 +320,63 @@ fn process_mouse_click(
 ) {
     if let Ok((pos, original, mut displayed)) = tiles.get_mut(click.event_target()) {
         if pos.location.y >= 0.0 {
-            let value = &mut game_data.values[pos.location.y as usize][pos.location.z as usize]
-                [pos.location.x as usize];
-            value.toggle();
+            let value = toggle_layer_value(&mut game_data, pos.location);
 
-            let base = if *value { &original.0 } else { &original.1 };
+            let base = if value { &original.0 } else { &original.1 };
             displayed.0 = highlight_for(base, &mut cache, &mut materials, SQUARE_HOVER_FACTOR);
         }
     }
 }
 
+fn toggle_layer_value(game_data: &mut GameData, location: Vec3) -> bool {
+    let value =
+        &mut game_data.values[location.y as usize][location.z as usize][location.x as usize];
+    value.toggle();
+    *value
+}
+
+fn toggle_puzzle_solution(
+    game_data: &mut GameData,
+    position: &PositionData,
+    sphere_transform: &mut Transform,
+    sphere_visibility: &mut Visibility,
+) {
+    let x = position.location.x as usize;
+    let z = position.location.z as usize;
+
+    if game_data.solution == Some((x, z)) {
+        game_data.solution = None;
+        *sphere_visibility = Visibility::Hidden;
+    } else {
+        game_data.solution = Some((x, z));
+        sphere_transform.translation =
+            Vec3::new(position.location.x, 0.5, position.location.z - 5.0);
+        *sphere_visibility = Visibility::Visible;
+    }
+}
+
+fn process_puzzle_click(
+    click: On<PointerClick>,
+    mut game_data: ResMut<GameData>,
+    tiles: Query<&PositionData>,
+    mut sphere: Query<(&mut Transform, &mut Visibility), With<PuzzleSolutionSphere>>,
+) {
+    let Ok(position) = tiles.get(click.event_target()) else {
+        return;
+    };
+    if position.location.y >= 0.0 {
+        return;
+    }
+    let Ok((mut transform, mut visibility)) = sphere.single_mut() else {
+        return;
+    };
+
+    toggle_puzzle_solution(&mut game_data, position, &mut transform, &mut visibility);
+}
+
 fn update_chosen_tile(
     game: Res<GameData>,
+    highlight_layers: Res<HighlightLayers>,
     mut cache: ResMut<HighlightCache>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     tiles: Query<(
@@ -300,35 +385,154 @@ fn update_chosen_tile(
         &mut MeshMaterial3d<StandardMaterial>,
     )>,
 ) {
-    if game.is_changed() {
-        let mut total = 0;
-        for power in 0..6 {
-            if layer_parity(&game, power) {
-                total += 1 << power;
-            }
-        }
-        let x = total % 8;
-        let y = total / 8;
-        for (position, original_material, mut material) in tiles {
-            if position.location.y < 0.0 {
-                if position.location.x == x as f32 && position.location.z == y as f32 {
-                    material.0 = highlight_for(&mut material, &mut cache, &mut materials, 2)
-                } else {
-                    material.0 = original_material.0.clone();
+    if !game.is_changed() && !highlight_layers.is_changed() {
+        return;
+    }
+
+    for (position, original_material, mut material) in tiles {
+        if position.location.y < 0.0 {
+            let x = position.location.x as usize;
+            let z = position.location.z as usize;
+            let desired = match puzzle_tile_highlight_variant(&game, &highlight_layers, x, z) {
+                Some(variant) => {
+                    highlight_for(&original_material.0, &mut cache, &mut materials, variant)
                 }
+                None => original_material.0.clone(),
+            };
+            if material.0 != desired {
+                material.0 = desired;
             }
         }
     }
 }
 
-fn layer_parity(game: &Res<GameData>, layer: usize) -> bool {
+fn puzzle_tile_highlight_variant(
+    game: &GameData,
+    highlight_layers: &HighlightLayers,
+    x: usize,
+    z: usize,
+) -> Option<i32> {
+    let parity_target = target_tile_coords(
+        (0..6)
+            .filter(|&layer| layer_parity(game, layer))
+            .map(|layer| 1 << layer)
+            .sum(),
+    );
+
+    let highlight = if (x, z) == parity_target {
+        Some(2)
+    } else if (x, z) == target_tile_coords(game.target) {
+        Some(3)
+    } else {
+        None
+    };
+    let selected = highlight_layers.on != 0 && (0..6)
+        .all(|layer| highlight_layers.on & (1 << layer) == 0 || highlight_layers.on & (1 << layer) != 0 && game.values[layer][z][x])
+        && (0..6).all(|layer| highlight_layers.off & (1 << layer) == 0 || highlight_layers.off & (1 << layer) != 0 && !game.values[layer][z][x]);
+
+    match (highlight, selected) {
+        (Some(2), true) => Some(5),
+        (Some(3), true) => Some(6),
+        (Some(variant), true) => Some(variant + 3),
+        (Some(variant), false) => Some(variant),
+        (None, true) => Some(4),
+        (None, false) => None,
+    }
+}
+
+fn target_tile_coords(target: u8) -> (usize, usize) {
+    (target as usize % 8, target as usize / 8)
+}
+
+fn layer_parity(game: &GameData, layer: usize) -> bool {
     let mut count = 0;
+    let mut solution_applied = false;
     for (i, j) in &game.puzzle {
+        if let Some((x, y)) = game.solution {
+            if x == *i && y == *j {
+                solution_applied = true;
+                continue;
+            }
+        }
         if game.values[layer][*j][*i] {
             count += 1;
         }
     }
+    if let Some((x, z)) = game.solution
+        && !solution_applied
+        && game.values[layer][z][x]
+    {
+        count += 1;
+    }
     count % 2 == 1
+}
+
+fn puzzle_coin_is_visible(game: &GameData, x: usize, z: usize) -> bool {
+    game.puzzle.contains(&(x, z))
+}
+
+fn puzzle_solution_sphere_visibility(game: &GameData) -> Visibility {
+    if game.solution.is_some() {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    }
+}
+
+fn sync_puzzle_board(
+    game: Res<GameData>,
+    mut coins: Query<(&PuzzleCoin, &mut Visibility)>,
+    mut sphere: Query<&mut Visibility, (With<PuzzleSolutionSphere>, Without<PuzzleCoin>)>,
+) {
+    if !game.is_changed() {
+        return;
+    }
+
+    for (coin, mut visibility) in &mut coins {
+        let visible = puzzle_coin_is_visible(&game, coin.x, coin.z);
+        *visibility = if visible {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+
+    for mut visibility in &mut sphere {
+        *visibility = puzzle_solution_sphere_visibility(&game);
+    }
+}
+
+fn sync_layer_tiles(
+    game: Res<GameData>,
+    hovered: Res<HoveredTile>,
+    mut cache: ResMut<HighlightCache>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut tiles: Query<(
+        Entity,
+        &Square,
+        &OriginalMaterial,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
+) {
+    if !game.is_changed() {
+        return;
+    }
+
+    for (entity, square, original, mut material) in &mut tiles {
+        let base = if game.values[square.x][square.y][square.z] {
+            &original.0
+        } else {
+            &original.1
+        };
+        let desired = if hovered.0 == Some(entity) {
+            highlight_for(base, &mut cache, &mut materials, SQUARE_HOVER_FACTOR)
+        } else {
+            base.clone()
+        };
+        if material.0 != desired {
+            material.0 = desired;
+        }
+    }
 }
 
 fn update_tile_labels(
@@ -374,7 +578,7 @@ fn update_tile_labels(
         node.left = px(screen.x / ui_scale.0 - 40.0);
         node.top = px(screen.y / ui_scale.0 - 16.0);
 
-        let number: usize = (0..8)
+        let number: usize = (0..6)
             .map(|bit| (game.values[bit][square.y][square.z] as usize) << bit)
             .sum();
 
@@ -415,9 +619,17 @@ fn highlight_for(
     } else if variant == 2 {
         mat.base_color = Color::from(BLUE_200);
         mat.emissive = LinearRgba::rgb(0.0, 0.0, 0.3);
-    } else {
+    } else if variant == 3 {
         mat.base_color = Color::from(GREEN_200);
         mat.emissive = LinearRgba::rgb(0.0, 0.3, 0.0);
+    } else if variant == 5 {
+        mat.base_color = Color::from(CYAN_200);
+        mat.emissive = LinearRgba::rgb(0.0, 0.3, 0.3);
+    } else if variant == 6 {
+        mat.base_color = Color::from(YELLOW_200);
+        mat.emissive = LinearRgba::rgb(0.3, 0.3, 0.0);
+    } else {
+        mat.emissive = LinearRgba::from(AMBER_200);
     }
 
     let hi = materials.add(mat);
@@ -518,7 +730,6 @@ pub fn load_wooden_materials(
 fn create_squares(
     commands: &mut Commands,
     game_data: &ResMut<GameData>,
-    mut cache: ResMut<HighlightCache>,
     asset_server: &Res<AssetServer>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
     meshes: &mut ResMut<Assets<Mesh>>,
@@ -547,7 +758,7 @@ fn create_squares(
                         .with_translation(Vec3 {
                             x: i as f32,
                             y: -0.2 - k as f32 / 2.0,
-                            z: j as f32,
+                            z: j as f32 + 5.0,
                         }),
                         PositionData { location },
                         OriginalMaterial(mat1.clone(), mat2.clone()),
@@ -592,20 +803,23 @@ fn create_squares(
         }
     }
 
+    let coin_material = materials.add(StandardMaterial {
+        base_color: AMBER_200.into(),
+        metallic: 0.5,
+        ..Default::default()
+    });
+    let coin_mesh = meshes.add(Mesh::from(Extrusion::new(Circle::new(0.35), 0.2)));
+
     for i in 0..8 {
         for j in 0..8 {
             let location = Vec3::new(i as f32, -1.0, j as f32);
             let mesh_handle = meshes.add(Mesh::from(Cuboid::new(1.0, 1.0, 0.4)));
 
-            let mut base_mat = if (i + j) % 2 == 0 {
+            let base_mat = if (i + j) % 2 == 0 {
                 mat1.clone()
             } else {
                 mat2.clone()
             };
-
-            if i * 8 + j == game_data.target {
-                base_mat = highlight_for(&mut base_mat, &mut cache, materials, 3);
-            }
 
             commands
                 .spawn((
@@ -615,41 +829,55 @@ fn create_squares(
                         .with_translation(Vec3 {
                             x: i as f32,
                             y: -0.2,
-                            z: j as f32 - 10.0,
+                            z: j as f32 - 5.0,
                         }),
                     PositionData { location },
                     OriginalMaterial(base_mat.clone(), base_mat.clone()),
                 ))
                 .observe(remember_hover)
                 .observe(forget_hover)
-                .observe(process_mouse_click);
+                .observe(process_mouse_click)
+                .observe(process_puzzle_click);
 
-            if game_data.puzzle.contains(&(i as usize, j as usize)) {
-                let mesh_handle = meshes.add(Mesh::from(Extrusion::new(Circle::new(0.35), 0.2)));
-
-                commands.spawn((
-                    Mesh3d(mesh_handle),
-                    MeshMaterial3d(materials.add(StandardMaterial {
-                        base_color: AMBER_200.into(),
-                        metallic: 0.5,
-                        ..Default::default()
-                    })),
-                    Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
-                        .with_translation(Vec3 {
-                            x: i as f32,
-                            y: 0.0,
-                            z: j as f32 - 10.0,
-                        }),
-                ));
-            }
+            let coin_visible = puzzle_coin_is_visible(game_data, i, j);
+            commands.spawn((
+                Mesh3d(coin_mesh.clone()),
+                MeshMaterial3d(coin_material.clone()),
+                Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
+                    .with_translation(Vec3 {
+                        x: i as f32,
+                        y: 0.0,
+                        z: j as f32 - 5.0,
+                    }),
+                if coin_visible {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                },
+                Pickable::IGNORE,
+                PuzzleCoin { x: i, z: j },
+            ));
         }
     }
+
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(0.3).mesh().uv(32, 18))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: STONE_200.into(),
+            ..default()
+        })),
+        Transform::default(),
+        Visibility::Hidden,
+        Pickable::IGNORE,
+        PuzzleSolutionSphere,
+    ));
 }
 
 fn keyboard_input_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut game_data: ResMut<GameData>,
     mut draw_numbers: ResMut<DrawNumbers>,
+    mut highlight_layers: ResMut<HighlightLayers>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if keyboard.just_pressed(KeyCode::Minus) {
@@ -665,8 +893,25 @@ fn keyboard_input_system(
     if keyboard.just_pressed(KeyCode::KeyQ) {
         exit.write(AppExit::Success);
     }
+    if keyboard.just_pressed(KeyCode::KeyC) {
+        game_data.values = vec![vec![vec![false; 8]; 8]; 6];
+    }
+    if keyboard.just_pressed(KeyCode::KeyR) {
+        (game_data.target, game_data.puzzle) = generate_puzzle();
+        game_data.solution = None;
+    }
     if keyboard.just_pressed(KeyCode::KeyN) {
         draw_numbers.0.toggle()
+    }
+    if keyboard.just_pressed(KeyCode::KeyH) {
+        if highlight_layers.on & 1 << game_data.layer != 0 {
+            highlight_layers.on ^= 1 << game_data.layer;
+            highlight_layers.off ^= 1 << game_data.layer;
+        } else if highlight_layers.off & 1 << game_data.layer != 0 {
+            highlight_layers.off ^= 1 << game_data.layer;
+        } else {
+            highlight_layers.on ^= 1 << game_data.layer;
+        }
     }
 }
 
@@ -674,7 +919,6 @@ fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     game_data: ResMut<GameData>,
-    cache: ResMut<HighlightCache>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
@@ -682,7 +926,6 @@ fn setup(
     create_squares(
         &mut commands,
         &game_data,
-        cache,
         &asset_server,
         &mut materials,
         &mut meshes,
@@ -698,7 +941,7 @@ fn setup(
 
     commands.spawn((
         Camera3d { ..default() },
-        Transform::from_xyz(12., 7., 4.).looking_at(
+        Transform::from_xyz(14., 14., 4.).looking_at(
             Vec3 {
                 x: 4.,
                 y: 0.,
@@ -765,6 +1008,7 @@ fn main() {
         .add_plugins(PanOrbitCameraPlugin)
         .init_resource::<HoveredTile>()
         .init_resource::<DrawNumbers>()
+        .init_resource::<HighlightLayers>()
         .insert_resource(GameData::default())
         .insert_resource(ButtonInput::<KeyCode>::default())
         .insert_resource(HighlightCache::default())
@@ -777,7 +1021,9 @@ fn main() {
                 update_layer_hud,
                 update_hover_hud,
                 pan_camera,
-                update_chosen_tile,
+                sync_layer_tiles,
+                update_chosen_tile.after(keyboard_input_system),
+                sync_puzzle_board.after(keyboard_input_system),
             ),
         )
         .add_systems(
