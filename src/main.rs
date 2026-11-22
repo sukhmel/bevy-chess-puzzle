@@ -1011,13 +1011,12 @@ fn keyboard_input_system(
     }
     if keyboard.just_pressed(KeyCode::KeyS) {
         let mut values = vec![vec![vec![false; 8]; 8]; 6];
-        for power in 0..6 {
-            for x in 0..8 {
-                for y in 0..8 {
-                    let bit = ((7 - x) + y * 8) / (1 << power);
-                    if bit % 2 == 1 {
-                        values[power][x][y] = true;
-                    }
+        for x in 0..8 {
+            for y in 0..8 {
+                // serpentine :)
+                let bit = (7 - x) * ((y + 1) % 2) + x * (y % 2) + y * 8;
+                for power in 0..6 {
+                    values[power][x][y] = (bit >> power) & 1 == 1;
                 }
             }
         }
