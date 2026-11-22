@@ -3,6 +3,7 @@
 // JetBrainsMono Font is licensed under SIL Open Font License 1.1: <https://github.com/JetBrains/JetBrainsMono/tree/master>
 
 use bevy::color::palettes::tailwind::*;
+use bevy::light::NotShadowCaster;
 use bevy::prelude::*;
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 use rand::RngExt;
@@ -14,9 +15,40 @@ use std::iter::once;
 const SQUARE_HOVER_FACTOR: i32 = 1;
 
 #[derive(Component)]
+struct InstructionHud;
+
+#[derive(Component)]
 struct LayerHud;
 
 fn setup_hud(commands: &mut Commands, asset_server: &Res<AssetServer>) {
+    commands.spawn((
+        InstructionHud,
+        Text::new("[T]Toggle highlight: include/exclude/off,\n\
+        [C]lear all selections\n\
+        [L]ayer selections clear\n\
+        [R]estart, \n\
+        [S]olution,\n\
+        [H]ints\n\
+        [N]umbers\n\
+        [V]iew upper layers\n\
+        [Q]uit,\n\
+        [-] layer down\n\
+        [=] layer up\n\
+        [←][→][↑][↓] pan camera"),
+        TextFont {
+            font: asset_server.load("fonts/JetBrainsMono-Medium.ttf").into(),
+            font_size: FontSize::Px(24.0),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(10),
+            left: px(20),
+            ..default()
+        },
+        Pickable::IGNORE,
+    ));
+
     commands.spawn((
         LayerHud,
         Text::new(""),
@@ -27,7 +59,7 @@ fn setup_hud(commands: &mut Commands, asset_server: &Res<AssetServer>) {
         },
         Node {
             position_type: PositionType::Absolute,
-            top: px(20),
+            top: px(350),
             left: px(20),
             ..default()
         },
@@ -44,7 +76,7 @@ fn setup_hud(commands: &mut Commands, asset_server: &Res<AssetServer>) {
         },
         Node {
             position_type: PositionType::Absolute,
-            top: px(49),
+            top: px(379),
             left: px(80),
             ..default()
         },
@@ -61,7 +93,7 @@ fn setup_hud(commands: &mut Commands, asset_server: &Res<AssetServer>) {
         },
         Node {
             position_type: PositionType::Absolute,
-            top: px(279),
+            top: px(609),
             left: px(80),
             ..default()
         },
@@ -71,14 +103,15 @@ fn setup_hud(commands: &mut Commands, asset_server: &Res<AssetServer>) {
 
 fn update_layer_hud(
     game: Res<GameData>,
+    show_hints: Res<ShowHints>,
     highlight_layers: Res<HighlightLayers>,
     mut hud: Query<&mut Text, With<LayerHud>>,
 ) {
-    if !game.is_changed() && !highlight_layers.is_changed() {
+    if !game.is_changed() && !highlight_layers.is_changed() && !show_hints.is_changed() {
         return;
     }
 
-    let lines = once("Bits:".to_string())
+    let layers = once("Layers:".to_string())
         .chain((0..6).map(|layer| {
             format!(
                 "{} {layer}{}",
@@ -92,6 +125,17 @@ fn update_layer_hud(
                 }
             )
         }))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if !show_hints.0 {
+        for mut text in &mut hud {
+            text.0 = layers.clone();
+        }
+        return;
+    }
+
+    let lines = once(layers)
         .chain(once(format!("\nTarget:",)))
         .chain((0..6).map(|bit| format!("  {}", (game.target >> bit) % 2)))
         .collect::<Vec<_>>()
@@ -103,7 +147,13 @@ fn update_layer_hud(
 }
 
 #[derive(Resource, Default)]
+struct ShowHints(bool);
+
+#[derive(Resource, Default)]
 struct DrawNumbers(bool);
+
+#[derive(Resource, Default)]
+struct ShowUpperLayers(bool);
 
 #[derive(Resource, Default)]
 struct HighlightLayers {
@@ -143,13 +193,24 @@ fn forget_hover(out: On<PointerOut>, mut hovered: ResMut<HoveredTile>) {
 
 fn update_hover_hud(
     hovered: Res<HoveredTile>,
+    show_hints: Res<ShowHints>,
     game: Res<GameData>,
     squares: Query<&Square>,
     position: Query<&PositionData>,
     mut hud: Query<&mut Text, (With<HoverHud>, Without<PuzzleHud>)>,
     mut puzzle_hud: Query<&mut Text, (With<PuzzleHud>, Without<HoverHud>)>,
 ) {
-    if !hovered.is_changed() && !game.is_changed() {
+    if !show_hints.0 {
+        for mut text in &mut hud {
+            text.0 = String::new();
+        }
+        for mut text in &mut puzzle_hud {
+            text.0 = String::new();
+        }
+        return;
+    }
+
+    if !hovered.is_changed() && !game.is_changed() && !show_hints.is_changed() {
         return;
     }
 
@@ -235,6 +296,9 @@ impl Hash for HighlightKey {
 #[derive(Resource, Default)]
 struct HighlightCache(HashMap<HighlightKey, Handle<StandardMaterial>>);
 
+#[derive(Resource, Default)]
+struct GhostMaterialCache(HashMap<Handle<StandardMaterial>, Handle<StandardMaterial>>);
+
 #[derive(Resource)]
 struct GameData {
     layer: usize,
@@ -282,31 +346,6 @@ fn generate_puzzle() -> (u8, Vec<(usize, usize)>) {
     (target, puzzle)
 }
 
-fn update_layer_visibility(
-    game_data: Res<GameData>,
-    mut query: Query<(&PositionData, &mut Visibility)>,
-) {
-    // Only execute state mutations when game data changes to minimize resource consumption
-    if !game_data.is_changed() {
-        return;
-    }
-
-    for (pos, mut visibility) in &mut query {
-        if pos.location.y < 0.0 {
-            continue;
-        }
-
-        let layer_index = pos.location.y as usize;
-
-        // Hide layers situated strictly above the currently active layer
-        if layer_index < game_data.layer {
-            *visibility = Visibility::Hidden;
-        } else {
-            *visibility = Visibility::Inherited;
-        }
-    }
-}
-
 fn process_mouse_click(
     click: On<PointerClick>,
     mut game_data: ResMut<GameData>,
@@ -319,7 +358,7 @@ fn process_mouse_click(
     )>,
 ) {
     if let Ok((pos, original, mut displayed)) = tiles.get_mut(click.event_target()) {
-        if pos.location.y >= 0.0 {
+        if pos.location.y >= game_data.layer as f32 {
             let value = toggle_layer_value(&mut game_data, pos.location);
 
             let base = if value { &original.0 } else { &original.1 };
@@ -503,28 +542,56 @@ fn sync_puzzle_board(
 }
 
 fn sync_layer_tiles(
+    mut commands: Commands,
     game: Res<GameData>,
+    show_upper_layers: Res<ShowUpperLayers>,
     hovered: Res<HoveredTile>,
     mut cache: ResMut<HighlightCache>,
+    mut ghost_cache: ResMut<GhostMaterialCache>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut tiles: Query<(
         Entity,
         &Square,
         &OriginalMaterial,
         &mut MeshMaterial3d<StandardMaterial>,
+        &mut Visibility,
+        &mut Pickable,
+        Has<NotShadowCaster>,
     )>,
 ) {
-    if !game.is_changed() {
+    if !game.is_changed() && !show_upper_layers.is_changed() {
         return;
     }
 
-    for (entity, square, original, mut material) in &mut tiles {
+    for (entity, square, original, mut material, mut visibility, mut pickable, no_shadow) in
+        &mut tiles
+    {
+        let upper = square.x < game.layer;
+        if upper && show_upper_layers.0 {
+            if !no_shadow {
+                commands.entity(entity).insert(NotShadowCaster);
+            }
+        } else if no_shadow {
+            commands.entity(entity).remove::<NotShadowCaster>();
+        }
+        *visibility = if upper && !show_upper_layers.0 {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
+        *pickable = if upper {
+            Pickable::IGNORE
+        } else {
+            Pickable::default()
+        };
         let base = if game.values[square.x][square.y][square.z] {
             &original.0
         } else {
             &original.1
         };
-        let desired = if hovered.0 == Some(entity) {
+        let desired = if upper && show_upper_layers.0 {
+            ghost_material_for(base, &mut ghost_cache, &mut materials)
+        } else if !upper && hovered.0 == Some(entity) {
             highlight_for(base, &mut cache, &mut materials, SQUARE_HOVER_FACTOR)
         } else {
             base.clone()
@@ -533,6 +600,25 @@ fn sync_layer_tiles(
             material.0 = desired;
         }
     }
+}
+
+fn ghost_material_for(
+    base: &Handle<StandardMaterial>,
+    cache: &mut GhostMaterialCache,
+    materials: &mut Assets<StandardMaterial>,
+) -> Handle<StandardMaterial> {
+    if let Some(material) = cache.0.get(base) {
+        return material.clone();
+    }
+
+    let Some(mut material) = materials.get(base).cloned() else {
+        return base.clone();
+    };
+    material.base_color = material.base_color.with_alpha(0.05);
+    material.alpha_mode = AlphaMode::Blend;
+    let ghost = materials.add(material);
+    cache.0.insert(base.clone(), ghost.clone());
+    ghost
 }
 
 fn update_tile_labels(
@@ -654,6 +740,9 @@ fn swap_to_highlight_on<E: bevy::prelude::EntityEvent>(
             orig_q.get(trigger.event_target()),
             pos_data.get(trigger.event_target()),
         ) {
+            if pos_data.location.y < game_data.layer as f32 {
+                return;
+            }
             let base_mat = if game_data.values[pos_data.location.y as usize]
                 [pos_data.location.z as usize][pos_data.location.x as usize]
             {
@@ -680,6 +769,9 @@ fn swap_back_on<E: bevy::prelude::EntityEvent>() -> impl Fn(
             orig_q.get(trigger.event_target()),
             pos_data.get(trigger.event_target()),
         ) {
+            if pos_data.location.y < game_data.layer as f32 {
+                return;
+            }
             let base_mat = if game_data.values[pos_data.location.y as usize]
                 [pos_data.location.z as usize][pos_data.location.x as usize]
             {
@@ -763,6 +855,8 @@ fn create_squares(
                         PositionData { location },
                         OriginalMaterial(mat1.clone(), mat2.clone()),
                         Square { x: k, y: j, z: i },
+                        Visibility::Inherited,
+                        Pickable::default(),
                     ))
                     .observe(swap_to_highlight_on::<PointerOver>(SQUARE_HOVER_FACTOR))
                     .observe(swap_back_on::<PointerOut>())
@@ -876,7 +970,9 @@ fn create_squares(
 fn keyboard_input_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut game_data: ResMut<GameData>,
+    mut show_hints: ResMut<ShowHints>,
     mut draw_numbers: ResMut<DrawNumbers>,
+    mut show_upper_layers: ResMut<ShowUpperLayers>,
     mut highlight_layers: ResMut<HighlightLayers>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -893,8 +989,15 @@ fn keyboard_input_system(
     if keyboard.just_pressed(KeyCode::KeyQ) {
         exit.write(AppExit::Success);
     }
+    if keyboard.just_pressed(KeyCode::KeyH) {
+        show_hints.0.toggle();
+    }
     if keyboard.just_pressed(KeyCode::KeyC) {
         game_data.values = vec![vec![vec![false; 8]; 8]; 6];
+    }
+    if keyboard.just_pressed(KeyCode::KeyL) {
+        let layer = game_data.layer;
+        game_data.values[layer] = vec![vec![false; 8]; 8];
     }
     if keyboard.just_pressed(KeyCode::KeyR) {
         (game_data.target, game_data.puzzle) = generate_puzzle();
@@ -903,7 +1006,24 @@ fn keyboard_input_system(
     if keyboard.just_pressed(KeyCode::KeyN) {
         draw_numbers.0.toggle()
     }
-    if keyboard.just_pressed(KeyCode::KeyH) {
+    if keyboard.just_pressed(KeyCode::KeyV) {
+        show_upper_layers.0.toggle();
+    }
+    if keyboard.just_pressed(KeyCode::KeyS) {
+        let mut values = vec![vec![vec![false; 8]; 8]; 6];
+        for power in 0..6 {
+            for x in 0..8 {
+                for y in 0..8 {
+                    let bit = ((7 - x) + y * 8) / (1 << power);
+                    if bit % 2 == 1 {
+                        values[power][x][y] = true;
+                    }
+                }
+            }
+        }
+        game_data.values = values;
+    }
+    if keyboard.just_pressed(KeyCode::KeyT) {
         if highlight_layers.on & 1 << game_data.layer != 0 {
             highlight_layers.on ^= 1 << game_data.layer;
             highlight_layers.off ^= 1 << game_data.layer;
@@ -1007,21 +1127,23 @@ fn main() {
         .add_plugins(MeshPickingPlugin)
         .add_plugins(PanOrbitCameraPlugin)
         .init_resource::<HoveredTile>()
+        .init_resource::<ShowHints>()
         .init_resource::<DrawNumbers>()
+        .init_resource::<ShowUpperLayers>()
         .init_resource::<HighlightLayers>()
         .insert_resource(GameData::default())
         .insert_resource(ButtonInput::<KeyCode>::default())
         .insert_resource(HighlightCache::default())
+        .init_resource::<GhostMaterialCache>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
                 keyboard_input_system,
-                update_layer_visibility,
                 update_layer_hud,
                 update_hover_hud,
                 pan_camera,
-                sync_layer_tiles,
+                sync_layer_tiles.after(keyboard_input_system),
                 update_chosen_tile.after(keyboard_input_system),
                 sync_puzzle_board.after(keyboard_input_system),
             ),
